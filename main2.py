@@ -14,12 +14,6 @@ import rembg
 from cam_utils import orbit_camera, OrbitCamera
 from mesh_renderer import Renderer
 
-# measrement
-import numpy as np
-import csv, os
-from skimage.metrics import peak_signal_noise_ratio as compute_psnr
-from skimage.metrics import structural_similarity    as compute_ssim
-from lpips import LPIPS         # pip install lpips
 # from kiui.lpips import LPIPS
 
 class GUI:
@@ -66,14 +60,7 @@ class GUI:
         self.optimizer = None
         self.step = 0
         self.train_steps = 1  # steps per rendering loop
-        # —— 新增：LPIPS 评估模型 —— 
-        self.lpips_metric = LPIPS(net='vgg').to(self.device)
-
-        # —— 新增：训练指标日志 —— 
-        os.makedirs('logs', exist_ok=True)
-        self.metric_log    = open('logs/train_metrics.csv', 'w', newline='')
-        self.metric_writer = csv.writer(self.metric_log)
-        self.metric_writer.writerow(['step','psnr','ssim','lpips'])  
+ 
         
               
         # load input data from cmdline
