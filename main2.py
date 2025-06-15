@@ -13,13 +13,15 @@ import rembg
 
 from cam_utils import orbit_camera, OrbitCamera
 from mesh_renderer import Renderer
+from lpips import LPIPS
+import torch.nn.functional as F
 
-# from kiui.lpips import LPIPS
 
 class GUI:
     def __init__(self, opt):
-        self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
-        self.gui = opt.gui # enable gui
+        # shared with the trainer's opt to support in-place modification of rendering parameters.
+        self.opt = opt
+        self.gui = opt.gui  # enable gui
         self.W = opt.W
         self.H = opt.H
         self.cam = OrbitCamera(opt.W, opt.H, r=opt.radius, fovy=opt.fovy)
@@ -42,7 +44,7 @@ class GUI:
 
         # renderer
         self.renderer = Renderer(opt).to(self.device)
-
+        self.lpips_loss = LPIPS(net='vgg').to(self.device)
         # input image
         self.input_img = None
         self.input_mask = None
@@ -61,17 +63,17 @@ class GUI:
         self.step = 0
         self.train_steps = 1  # steps per rendering loop
         # self.lpips_loss = LPIPS(net='vgg').to(self.device)
-        
+
         # load input data from cmdline
         if self.opt.input is not None:
             self.load_input(self.opt.input)
-        
+
         # override prompt from cmdline
         if self.opt.prompt is not None:
             self.prompt = self.opt.prompt
         if self.opt.negative_prompt is not None:
             self.negative_prompt = self.opt.negative_prompt
-        
+
         if self.gui:
             dpg.create_context()
             self.register_dpg()
@@ -111,7 +113,6 @@ class GUI:
             pose = orbit_camera(self.opt.elevation, 0, self.opt.radius)
 
         self.fixed_cam = (pose, self.cam.perspective)
-        
 
         self.enable_sd = self.opt.lambda_sd > 0 and self.prompt != ""
         self.enable_zero123 = self.opt.lambda_zero123 > 0 and self.input_img is not None
@@ -138,27 +139,36 @@ class GUI:
             print(f"[INFO] loading zero123...")
             from guidance.zero123_utils import Zero123
             if self.opt.stable_zero123:
-                self.guidance_zero123 = Zero123(self.device, model_key='ashawkey/stable-zero123-diffusers')
+                self.guidance_zero123 = Zero123(
+                    self.device, model_key='ashawkey/stable-zero123-diffusers')
             else:
-                self.guidance_zero123 = Zero123(self.device, model_key='ashawkey/zero123-xl-diffusers')
+                self.guidance_zero123 = Zero123(
+                    self.device, model_key='ashawkey/zero123-xl-diffusers')
             print(f"[INFO] loaded zero123!")
         # input image
         if self.input_img is not None:
-            self.input_img_torch = torch.from_numpy(self.input_img).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            self.input_img_torch = F.interpolate(self.input_img_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
+            self.input_img_torch = torch.from_numpy(self.input_img).permute(
+                2, 0, 1).unsqueeze(0).to(self.device)
+            self.input_img_torch = F.interpolate(self.input_img_torch, (
+                self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
 
-            self.input_mask_torch = torch.from_numpy(self.input_mask).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            self.input_mask_torch = F.interpolate(self.input_mask_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
-            self.input_img_torch_channel_last = self.input_img_torch[0].permute(1,2,0).contiguous()
+            self.input_mask_torch = torch.from_numpy(
+                self.input_mask).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            self.input_mask_torch = F.interpolate(self.input_mask_torch, (
+                self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
+            self.input_img_torch_channel_last = self.input_img_torch[0].permute(
+                1, 2, 0).contiguous()
 
         # prepare embeddings
         with torch.no_grad():
 
             if self.enable_sd:
                 if self.opt.imagedream:
-                    self.guidance_sd.get_image_text_embeds(self.input_img_torch, [self.prompt], [self.negative_prompt])
+                    self.guidance_sd.get_image_text_embeds(
+                        self.input_img_torch, [self.prompt], [self.negative_prompt])
                 else:
-                    self.guidance_sd.get_text_embeds([self.prompt], [self.negative_prompt])
+                    self.guidance_sd.get_text_embeds(
+                        [self.prompt], [self.negative_prompt])
 
             if self.enable_zero123:
                 self.guidance_zero123.get_img_embeds(self.input_img_torch)
@@ -168,7 +178,6 @@ class GUI:
         ender = torch.cuda.Event(enable_timing=True)
         starter.record()
 
-
         for _ in range(self.train_steps):
 
             self.step += 1
@@ -176,25 +185,38 @@ class GUI:
 
             loss = 0
 
-            ### known view
+            # known view
             if self.input_img_torch is not None and not self.opt.imagedream:
 
                 ssaa = min(2.0, max(0.125, 2 * np.random.random()))
-                out = self.renderer.render(*self.fixed_cam, self.opt.ref_size, self.opt.ref_size, ssaa=ssaa)
+                out = self.renderer.render(
+                    *self.fixed_cam, self.opt.ref_size, self.opt.ref_size, ssaa=ssaa)
 
-                # rgb loss
-                image = out["image"] # [H, W, 3] in [0, 1]
-                valid_mask = ((out["alpha"] > 0) & (out["viewcos"] > 0.5)).detach()
-                loss = loss + F.mse_loss(image * valid_mask, self.input_img_torch_channel_last * valid_mask)
+                # NOTE: Modified
+                image = out["image"]  # [H, W, 3] in [0, 1]
+                valid_mask = ((out["alpha"] > 0) & (
+                    out["viewcos"] > 0.5)).detach()
 
-            ### novel view (manual batch)
+                mse_loss = F.mse_loss(image * valid_mask,
+                                      self.input_img_torch_channel_last * valid_mask)
+
+                pred = (image.unsqueeze(0).permute(0, 3, 1, 2) * 2.0 - 1.0)
+                gt = (self.input_img_torch_channel_last.permute(
+                    0, 3, 1, 2) * 2.0 - 1.0)
+                perc_loss = self.lpips_loss(pred, gt).mean()
+
+                loss = loss + mse_loss + self.opt.perc_weight * perc_loss
+
+            # novel view (manual batch)
             render_resolution = 512
             images = []
             poses = []
             vers, hors, radii = [], [], []
             # avoid too large elevation (> 80 or < -80), and make sure it always cover [min_ver, max_ver]
-            min_ver = max(min(self.opt.min_ver, self.opt.min_ver - self.opt.elevation), -80 - self.opt.elevation)
-            max_ver = min(max(self.opt.max_ver, self.opt.max_ver - self.opt.elevation), 80 - self.opt.elevation)
+            min_ver = max(min(self.opt.min_ver, self.opt.min_ver -
+                          self.opt.elevation), -80 - self.opt.elevation)
+            max_ver = min(max(self.opt.max_ver, self.opt.max_ver -
+                          self.opt.elevation), 80 - self.opt.elevation)
             for _ in range(self.opt.batch_size):
 
                 # render random view
@@ -206,27 +228,33 @@ class GUI:
                 hors.append(hor)
                 radii.append(radius)
 
-                pose = orbit_camera(self.opt.elevation + ver, hor, self.opt.radius + radius)
+                pose = orbit_camera(self.opt.elevation + ver,
+                                    hor, self.opt.radius + radius)
                 poses.append(pose)
 
                 # random render resolution
                 ssaa = min(2.0, max(0.125, 2 * np.random.random()))
-                out = self.renderer.render(pose, self.cam.perspective, render_resolution, render_resolution, ssaa=ssaa)
+                out = self.renderer.render(
+                    pose, self.cam.perspective, render_resolution, render_resolution, ssaa=ssaa)
 
-                image = out["image"] # [H, W, 3] in [0, 1]
-                image = image.permute(2,0,1).contiguous().unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                image = out["image"]  # [H, W, 3] in [0, 1]
+                image = image.permute(2, 0, 1).contiguous(
+                ).unsqueeze(0)  # [1, 3, H, W] in [0, 1]
 
                 images.append(image)
 
                 # enable mvdream training
                 if self.opt.mvdream or self.opt.imagedream:
                     for view_i in range(1, 4):
-                        pose_i = orbit_camera(self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
+                        pose_i = orbit_camera(
+                            self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
                         poses.append(pose_i)
 
-                        out_i = self.renderer.render(pose_i, self.cam.perspective, render_resolution, render_resolution, ssaa=ssaa)
+                        out_i = self.renderer.render(
+                            pose_i, self.cam.perspective, render_resolution, render_resolution, ssaa=ssaa)
 
-                        image = out_i["image"].permute(2,0,1).contiguous().unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                        image = out_i["image"].permute(2, 0, 1).contiguous(
+                        ).unsqueeze(0)  # [1, 3, H, W] in [0, 1]
                         images.append(image)
 
             images = torch.cat(images, dim=0)
@@ -241,20 +269,29 @@ class GUI:
             if self.enable_sd:
                 if self.opt.mvdream or self.opt.imagedream:
                     # loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, poses, step_ratio)
-                    refined_images = self.guidance_sd.refine(images, poses, strength=strength).float()
-                    refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
-                    loss = loss + self.opt.lambda_sd * F.mse_loss(images, refined_images)
+                    refined_images = self.guidance_sd.refine(
+                        images, poses, strength=strength).float()
+                    refined_images = F.interpolate(
+                        refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
+                    loss = loss + self.opt.lambda_sd * \
+                        F.mse_loss(images, refined_images)
                 else:
                     # loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, step_ratio)
-                    refined_images = self.guidance_sd.refine(images, strength=strength).float()
-                    refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
-                    loss = loss + self.opt.lambda_sd * F.mse_loss(images, refined_images)
+                    refined_images = self.guidance_sd.refine(
+                        images, strength=strength).float()
+                    refined_images = F.interpolate(
+                        refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
+                    loss = loss + self.opt.lambda_sd * \
+                        F.mse_loss(images, refined_images)
 
             if self.enable_zero123:
                 # loss = loss + self.opt.lambda_zero123 * self.guidance_zero123.train_step(images, vers, hors, radii, step_ratio)
-                refined_images = self.guidance_zero123.refine(images, vers, hors, radii, strength=strength, default_elevation=self.opt.elevation).float()
-                refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
-                loss = loss + self.opt.lambda_zero123 * F.mse_loss(images, refined_images)
+                refined_images = self.guidance_zero123.refine(
+                    images, vers, hors, radii, strength=strength, default_elevation=self.opt.elevation).float()
+                refined_images = F.interpolate(
+                    refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
+                loss = loss + self.opt.lambda_zero123 * \
+                    F.mse_loss(images, refined_images)
                 # loss = loss + self.opt.lambda_zero123 * self.lpips_loss(images, refined_images)
 
             # optimize step
@@ -272,7 +309,8 @@ class GUI:
             dpg.set_value("_log_train_time", f"{t:.4f}ms")
             dpg.set_value(
                 "_log_train_log",
-                f"step = {self.step: 5d} (+{self.train_steps: 2d}) loss = {loss.item():.4f}",
+                f"step = {
+                    self.step: 5d} (+{self.train_steps: 2d}) loss = {loss.item():.4f}",
             )
 
         # dynamic train steps (no need for now)
@@ -296,17 +334,19 @@ class GUI:
         if self.need_update:
             # render image
 
-            out = self.renderer.render(self.cam.pose, self.cam.perspective, self.H, self.W)
+            out = self.renderer.render(
+                self.cam.pose, self.cam.perspective, self.H, self.W)
 
             buffer_image = out[self.mode]  # [H, W, 3]
 
             if self.mode in ['depth', 'alpha']:
                 buffer_image = buffer_image.repeat(1, 1, 3)
                 if self.mode == 'depth':
-                    buffer_image = (buffer_image - buffer_image.min()) / (buffer_image.max() - buffer_image.min() + 1e-20)
+                    buffer_image = (buffer_image - buffer_image.min()) / \
+                        (buffer_image.max() - buffer_image.min() + 1e-20)
 
             self.buffer_image = buffer_image.contiguous().clamp(0, 1).detach().cpu().numpy()
-            
+
             # display input_image
             if self.overlay_input_img and self.input_img is not None:
                 self.buffer_image = (
@@ -326,7 +366,6 @@ class GUI:
                 "_texture", self.buffer_image
             )  # buffer must be contiguous, else seg fault!
 
-    
     def load_input(self, file):
         # load image
         print(f'[INFO] load image from {file}...')
@@ -355,17 +394,18 @@ class GUI:
             print(f'[INFO] load prompt from {file_prompt}...')
             with open(file_prompt, "r") as f:
                 self.prompt = f.read().strip()
-    
+
     def save_model(self):
         os.makedirs(self.opt.outdir, exist_ok=True)
-    
-        path = os.path.join(self.opt.outdir, self.opt.save_path + '.' + self.opt.mesh_format)
+
+        path = os.path.join(
+            self.opt.outdir, self.opt.save_path + '.' + self.opt.mesh_format)
         self.renderer.export_mesh(path)
 
         print(f"[INFO] save model to {path}.")
 
     def register_dpg(self):
-        ### register texture
+        # register texture
 
         with dpg.texture_registry(show=False):
             dpg.add_raw_texture(
@@ -376,7 +416,7 @@ class GUI:
                 tag="_texture",
             )
 
-        ### register window
+        # register window
 
         # the rendered image, as the primary window
         with dpg.window(
@@ -407,8 +447,10 @@ class GUI:
             with dpg.theme() as theme_button:
                 with dpg.theme_component(dpg.mvButton):
                     dpg.add_theme_color(dpg.mvThemeCol_Button, (23, 3, 18))
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (51, 3, 47))
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (83, 18, 83))
+                    dpg.add_theme_color(
+                        dpg.mvThemeCol_ButtonHovered, (51, 3, 47))
+                    dpg.add_theme_color(
+                        dpg.mvThemeCol_ButtonActive, (83, 18, 83))
                     dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
                     dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 3)
 
@@ -461,7 +503,7 @@ class GUI:
                         callback=lambda: dpg.show_item("file_dialog_tag"),
                     )
                     dpg.add_text("", tag="_log_input")
-                
+
                 # overlay stuff
                 with dpg.group(horizontal=True):
 
@@ -489,7 +531,7 @@ class GUI:
                     )
 
                 # prompt stuff
-            
+
                 dpg.add_input_text(
                     label="prompt",
                     default_value=self.prompt,
@@ -579,7 +621,7 @@ class GUI:
                     callback=callback_set_fovy,
                 )
 
-        ### register camera handler
+        # register camera handler
 
         def callback_camera_drag_rotate_or_draw_mask(sender, app_data):
             if not dpg.is_item_focused("_primary_window"):
@@ -635,7 +677,7 @@ class GUI:
             resizable=False,
         )
 
-        ### global theme
+        # global theme
         with dpg.theme() as theme_no_padding:
             with dpg.theme_component(dpg.mvAll):
                 # set all padding to 0 to avoid scroll bar
@@ -653,7 +695,7 @@ class GUI:
 
         dpg.setup_dearpygui()
 
-        ### register a larger font
+        # register a larger font
         # get it from: https://github.com/lxgw/LxgwWenKai/releases/download/v1.300/LXGWWenKai-Regular.ttf
         if os.path.exists("LXGWWenKai-Regular.ttf"):
             with dpg.font_registry():
@@ -672,7 +714,7 @@ class GUI:
                 self.train_step()
             self.test_step()
             dpg.render_dearpygui_frame()
-    
+
     # no gui mode
     def train(self, iters=500):
         if iters > 0:
@@ -681,26 +723,32 @@ class GUI:
                 self.train_step()
         # save
         self.save_model()
-        
+
 
 if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="path to the yaml config file")
+    parser.add_argument("--config", required=True,
+                        help="path to the yaml config file")
+    parser.add_argument("--perc_weight", type=float, default=1.0,
+                        help="weight for LPIPS perceptual loss")
     args, extras = parser.parse_known_args()
 
     # override default config from cli
-    opt = OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_cli(extras))
+    opt = OmegaConf.merge(OmegaConf.load(args.config),
+                          OmegaConf.from_cli(extras))
 
     # auto find mesh from stage 1
     if opt.mesh is None:
-        default_path = os.path.join(opt.outdir, opt.save_path + '_mesh.' + opt.mesh_format)
+        default_path = os.path.join(
+            opt.outdir, opt.save_path + '_mesh.' + opt.mesh_format)
         if os.path.exists(default_path):
             opt.mesh = default_path
         else:
-            raise ValueError(f"Cannot find mesh from {default_path}, must specify --mesh explicitly!")
+            raise ValueError(f"Cannot find mesh from {
+                             default_path}, must specify --mesh explicitly!")
 
     gui = GUI(opt)
 
