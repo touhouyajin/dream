@@ -7,7 +7,13 @@ import dearpygui.dearpygui as dpg
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+import csv, os
 
+from skimage.metrics import peak_signal_noise_ratio as compute_psnr
+from skimage.metrics import structural_similarity    as compute_ssim
+from lpips import LPIPS     
+# pip install lpips
 import rembg
 
 from cam_utils import orbit_camera, OrbitCamera
@@ -62,6 +68,14 @@ class GUI:
         self.step = 0
         self.train_steps = 1  # steps per rendering loop
         
+        # training metrics
+        self.lpips_metric = LPIPS(net='vgg').to(self.device)
+        # —— 新增：训练指标日志 —— 
+        os.makedirs('logs', exist_ok=True)
+        self.metric_log    = open('logs/train_metrics.csv', 'w', newline='')
+        self.metric_writer = csv.writer(self.metric_log)
+        self.metric_writer.writerow(['step','psnr','ssim','lpips'])
+        
         # load input data from cmdline
         if self.opt.input is not None:
             self.load_input(self.opt.input)
@@ -87,7 +101,10 @@ class GUI:
     def __del__(self):
         if self.gui:
             dpg.destroy_context()
-
+        # 关闭训练指标日志文件
+        if hasattr(self, 'metric_log') and not self.metric_log.closed:
+            self.metric_log.close()
+            
     def seed_everything(self):
         try:
             seed = int(self.seed)
@@ -207,6 +224,23 @@ class GUI:
                 mask = out["alpha"].unsqueeze(0) # [1, 1, H, W] in [0, 1]
                 loss = loss + 1000 * (step_ratio if self.opt.warmup_rgb_loss else 1) * F.mse_loss(mask, self.input_mask_torch)
 
+                # —— 新增：计算并记录 PSNR / SSIM / LPIPS —— 
+                # 转为 H×W×3 uint8
+                pred_np = (image[0].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
+                gt_np   = (self.input_img_torch[0].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
+                psnr_val = compute_psnr(gt_np, pred_np, data_range=255)
+                ssim_val = np.mean([
+                    compute_ssim(gt_np[...,c], pred_np[...,c], data_range=255)
+                    for c in range(3)
+                ])
+                # LPIPS 需要先映射到 [-1,1]
+                pred_t = image * 2.0 - 1.0
+                gt_t   = self.input_img_torch * 2.0 - 1.0
+                lpips_val = self.lpips_metric(pred_t, gt_t).mean().item()
+
+                # 写入 CSV：step, psnr, ssim, lpips
+                self.metric_writer.writerow([self.step, psnr_val, ssim_val, lpips_val])
+                self.metric_log.flush()
             ### novel view (manual batch)
             render_resolution = 128 if step_ratio < 0.3 else (256 if step_ratio < 0.6 else 512)
             images = []
